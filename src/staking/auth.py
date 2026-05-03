@@ -24,6 +24,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
+from src.signing import dilithium
 
 log = structlog.get_logger(__name__)
 
@@ -74,41 +75,58 @@ def _canonical_message(action: str, address: str, amount: int, nonce: str, times
     return msg.encode("utf-8")
 
 
-def _verify_dilithium_stub(pubkey_hex: str, message: bytes, signature_hex: str) -> bool:
-    """STUB. Phase C replaces this with real Dilithium3.verify().
+def _verify_dilithium_real(pubkey_hex: str, message: bytes, signature_hex: str) -> bool:
+    """Real Dilithium3 signature verification (Phase C).
 
-    Phase B: returns True if signature is non-empty hex. Lets the API surface
-    be exercised end-to-end without the real verifier wired up.
+    Calls into src/signing/dilithium.py which wraps libnpc_dilithium3.so
+    (vendor pq-crystals reference, FIPS 204 ML-DSA-65).
 
-    DO NOT deploy this to production with the stub still in place.
-    A clear log warning is emitted so this can't slip past review.
+    Returns True iff signature is a valid Dilithium3 signature of `message`
+    under public key `pubkey_hex`. Returns False on any error -- format error,
+    short input, or genuine bad signature -- without leaking which.
     """
-    log.warning(
-        "DILITHIUM_VERIFY_STUBBED",
-        pubkey_prefix=pubkey_hex[:16],
-        sig_prefix=signature_hex[:16],
-        msg_len=len(message),
-        note="Phase C wiring required before production",
-    )
     if not signature_hex or len(signature_hex) < 10:
         return False
     if not pubkey_hex or len(pubkey_hex) < 10:
         return False
     try:
-        bytes.fromhex(signature_hex)
-        bytes.fromhex(pubkey_hex)
+        sig = bytes.fromhex(signature_hex)
+        pk = bytes.fromhex(pubkey_hex)
     except ValueError:
         return False
-    return True  # STUBBED — replace in Phase C
+    # Expected sizes: pk = 1952 bytes, sig = 3309 bytes (Dilithium3)
+    if len(pk) != 1952:
+        log.warning("dilithium_pk_size_mismatch", got=len(pk), expected=1952)
+        return False
+    if len(sig) != 3309:
+        log.warning("dilithium_sig_size_mismatch", got=len(sig), expected=3309)
+        return False
+    try:
+        return dilithium.verify(message, sig, pk)
+    except Exception as e:
+        log.warning("dilithium_verify_exception", error=str(e))
+        return False
 
 
-def _derive_address_stub(pubkey_hex: str) -> str:
-    """STUB. Phase C replaces with real address derivation.
+def _derive_address_real(pubkey_hex: str) -> str:
+    """Derive NPC address from Dilithium3 pubkey (Phase C).
 
-    Real derivation per NPChain: address = "NPC" + sha3_256(pubkey)[:20]_hex
-    Stub: returns input as-is (skips the pubkey↔address binding check).
+    Format: "NPC" + sha3_256(pubkey)[:20]_hex (40 hex chars + NPC prefix = 43 chars)
+    Returns empty string on any error.
     """
-    return ""  # Stub returns empty so the address check below is permissive
+    if not pubkey_hex or len(pubkey_hex) < 10:
+        return ""
+    try:
+        pk = bytes.fromhex(pubkey_hex)
+    except ValueError:
+        return ""
+    if len(pk) != 1952:
+        return ""
+    try:
+        return dilithium.derive_address(pk)
+    except Exception as e:
+        log.warning("dilithium_derive_exception", error=str(e))
+        return ""
 
 
 async def verify_signed_request(
@@ -133,10 +151,11 @@ async def verify_signed_request(
 
     msg = _canonical_message(action, address, amount, nonce, timestamp)
 
-    if not _verify_dilithium_stub(pubkey, msg, signature):
+    if not _verify_dilithium_real(pubkey, msg, signature):
         raise SignatureError("signature_invalid")
 
-    derived = _derive_address_stub(pubkey)
-    if derived and derived != address:
-        # Stub returns "" so this branch only triggers once Phase C lands
-        raise SignatureError(f"address_mismatch (pubkey derives to {derived})")
+    derived = _derive_address_real(pubkey)
+    if not derived:
+        raise SignatureError("could_not_derive_address_from_pubkey")
+    if derived != address:
+        raise SignatureError(f"address_mismatch (pubkey derives to {derived}, request claims {address})")

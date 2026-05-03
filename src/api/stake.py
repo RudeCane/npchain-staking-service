@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.db.models import Staker, UnstakeRequest, WatcherState
+from src.db.models import RewardPoolInflow, Staker, UnstakeRequest, ValidatorReward, WatcherState
 from src.db.session import get_session
 from src.migrations import canonicalize
 
@@ -69,6 +69,87 @@ async def get_stake(address: str, session: AsyncSession = Depends(get_session)) 
         "first_stake_height": staker.first_stake_height,
         "last_activity_height": staker.last_activity_height,
         "pending_unstakes": pending,
+    }
+
+
+@router.get("/pending-rewards/{address}")
+async def get_pending_rewards(
+    address: str, session: AsyncSession = Depends(get_session)
+) -> dict:
+    """Return claimable validator rewards for this address.
+
+    Earnings come from L1 fees_to_stakers paid into NPCREWARDSWALLET each block,
+    distributed proportionally to active validator stake. This endpoint reads
+    only — to actually claim, POST to /api/v1/claim-rewards with a Dilithium3
+    signature.
+    """
+    canonical = canonicalize(address)
+    rec = await session.get(ValidatorReward, canonical)
+
+    if rec is None:
+        return {
+            "address": canonical,
+            "input_address": address,
+            "pending_rewards": 0,
+            "pending_rewards_npc": "0.0000",
+            "total_claimed": 0,
+            "total_claimed_npc": "0.0000",
+            "last_credited_height": None,
+            "last_claimed_height": None,
+        }
+
+    return {
+        "address": canonical,
+        "input_address": address,
+        "pending_rewards": rec.pending_rewards,
+        "pending_rewards_npc": _to_npc(rec.pending_rewards),
+        "total_claimed": rec.total_claimed,
+        "total_claimed_npc": _to_npc(rec.total_claimed),
+        "last_credited_height": rec.last_credited_height,
+        "last_claimed_height": rec.last_claimed_height,
+    }
+
+
+@router.get("/rewards-pool/stats")
+async def get_rewards_pool_stats(session: AsyncSession = Depends(get_session)) -> dict:
+    """Aggregate stats about the validator rewards pool.
+
+    Inflow side: how many blocks have paid in, total amount, total dust.
+    Validator side: how much pending across all validators, how much claimed total.
+    """
+    from sqlalchemy import func
+
+    # Pool inflows
+    inflow_sum = await session.execute(
+        select(
+            func.coalesce(func.sum(RewardPoolInflow.amount), 0),
+            func.coalesce(func.sum(RewardPoolInflow.dust_remaining), 0),
+            func.count(RewardPoolInflow.id),
+        )
+    )
+    total_in, total_dust, blocks_processed = inflow_sum.one()
+
+    # Validator rewards aggregate
+    reward_sum = await session.execute(
+        select(
+            func.coalesce(func.sum(ValidatorReward.pending_rewards), 0),
+            func.coalesce(func.sum(ValidatorReward.total_claimed), 0),
+            func.count(ValidatorReward.address),
+        )
+    )
+    total_pending, total_claimed, validator_rows = reward_sum.one()
+
+    return {
+        "blocks_processed": blocks_processed,
+        "total_inflow": total_in,
+        "total_inflow_npc": _to_npc(total_in),
+        "total_dust": total_dust,
+        "total_dust_npc": _to_npc(total_dust),
+        "total_pending": total_pending,
+        "total_pending_npc": _to_npc(total_pending),
+        "total_claimed_lifetime": total_claimed,
+        "total_claimed_lifetime_npc": _to_npc(total_claimed),
+        "validators_with_rewards": validator_rows,
     }
 
 

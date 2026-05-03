@@ -169,3 +169,52 @@ class PendingPayout(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
     )
+
+
+class ValidatorReward(Base):
+    """Per-validator earned-from-work pending balance.
+
+    Credited when L1 transfers fees_to_stakers into NPCREWARDSWALLET... and
+    the watcher distributes that inflow proportionally across active validator
+    stake. Drained when the validator calls /api/v1/claim-rewards (which signs
+    a Dilithium3 message and triggers a PendingPayout(kind=REWARD_CLAIM)).
+
+    Note: this is NOT a "staking yield". Stake gates validator status only.
+    Validators earn from work; this table tracks how much each one is owed.
+    """
+
+    __tablename__ = "validator_rewards"
+
+    address: Mapped[str] = mapped_column(String(64), primary_key=True)
+    pending_rewards: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    total_claimed: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    last_credited_height: Mapped[int | None] = mapped_column(BigInteger)
+    last_claimed_height: Mapped[int | None] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+
+class RewardPoolInflow(Base):
+    """Per-block ledger of how much L1 paid into NPCREWARDSWALLET.
+
+    One row per L1 block that had fees_to_stakers > 0. Records the amount, how
+    many validators it was distributed across, and any rounding dust that
+    couldn't be perfectly divided. Audit trail for proving the off-L1
+    distribution math matches what L1 paid in.
+    """
+
+    __tablename__ = "reward_pool_inflows"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    block_height: Mapped[int] = mapped_column(BigInteger, nullable=False, unique=True, index=True)
+    amount: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    distributed_to_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    dust_remaining: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    processed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False
+    )
+

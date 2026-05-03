@@ -65,3 +65,22 @@ class CancelUnstake(BaseModel):
     timestamp: int = Field(..., gt=0)
     signature: str = Field(..., min_length=10)
     pubkey: str = Field(..., min_length=10)
+
+
+class ClaimRewards(BaseModel):
+    """User claims pending validator rewards.
+
+    Drains validator_rewards.pending_rewards for this address and queues a
+    PendingPayout(kind=REWARD_CLAIM) that the signing service consumes.
+
+    The canonical signed message uses amount=0 — the service drains whatever
+    is pending at processing time, so the user doesn't need to know (and
+    can't race with) the live balance.
+    """
+
+    address: str = Field(..., min_length=43, max_length=64)
+    nonce: str = Field(..., min_length=8, max_length=64)
+    timestamp: int = Field(..., gt=0)
+    signature: str = Field(..., min_length=10)
+    pubkey: str = Field(..., min_length=10)
+

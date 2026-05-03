@@ -15,9 +15,9 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.schemas import CancelUnstake, RequestUnstake
+from src.api.schemas import CancelUnstake, ClaimRewards, RequestUnstake
 from src.config import settings
-from src.db.models import Staker, UnstakeRequest, WatcherState
+from src.db.models import Staker, UnstakeRequest, ValidatorReward, WatcherState
 from src.db.session import get_session
 from src.signing.queue import enqueue_payout
 from src.staking.auth import SignatureError, verify_signed_request
@@ -171,3 +171,75 @@ async def cancel_unstake(
         "new_staked_amount": new_staked,
         "new_tier": new_tier.name,
     }
+
+
+@router.post("/claim-rewards")
+async def claim_rewards(
+    req: ClaimRewards, session: AsyncSession = Depends(get_session)
+) -> dict:
+    """Drain pending validator rewards into a queued L1 payout.
+
+    Canonical signed msg: CLAIM_REWARDS|{address}|0|{nonce}|{timestamp}
+
+    Reads pending_rewards atomically, zeros it, increments total_claimed,
+    and inserts a PendingPayout(kind=REWARD_CLAIM). The signer service
+    picks up the payout and submits the L1 TRANSFER from the pool wallet.
+    """
+    try:
+        await verify_signed_request(
+            action="CLAIM_REWARDS",
+            address=req.address,
+            amount=0,
+            nonce=req.nonce,
+            timestamp=req.timestamp,
+            signature=req.signature,
+            pubkey=req.pubkey,
+        )
+    except SignatureError as e:
+        raise HTTPException(status_code=401, detail=f"signature_error: {e}") from e
+
+    rec = await session.get(ValidatorReward, req.address)
+    if rec is None or rec.pending_rewards <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="no_pending_rewards",
+        )
+
+    height = await _current_height(session)
+    amount = rec.pending_rewards
+
+    # Atomic drain: zero pending, bump claimed counter.
+    rec.pending_rewards = 0
+    rec.total_claimed += amount
+    rec.last_claimed_height = height
+
+    # Queue the L1 payout. ref must be unique — use address + height + nonce
+    # so a re-submit with same nonce is idempotently rejected by the DB.
+    ref = f"reward_claim:{req.address}:{height}:{req.nonce}"
+    payout = await enqueue_payout(
+        session,
+        recipient=req.address,
+        amount=amount,
+        kind="REWARD_CLAIM",
+        ref=ref,
+    )
+
+    await session.commit()
+
+    log.info(
+        "rewards_claimed",
+        address=req.address,
+        amount=amount,
+        payout_id=payout.id if payout else None,
+        ref=ref,
+    )
+
+    return {
+        "status": "queued",
+        "amount": amount,
+        "amount_npc": f"{amount / 100_000_000:.4f}",
+        "payout_id": payout.id if payout else None,
+        "ref": ref,
+        "claimed_at_height": height,
+    }
+

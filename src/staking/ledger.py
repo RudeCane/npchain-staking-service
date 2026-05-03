@@ -35,11 +35,18 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
-from src.db.models import StakeEvent, Staker
+from src.db.models import RewardPoolInflow, StakeEvent, Staker, ValidatorReward
 from src.migrations import canonicalize
 from src.staking.tiers import tier_for
 
 log = structlog.get_logger(__name__)
+
+
+# Per-block validator rewards pool. L1 routes fees_to_stakers here every
+# block; we distribute proportionally to active validator stake.
+# Must match tx_fees::VALIDATOR_REWARDS_ADDRESS in src/testnet_node.cpp.
+VALIDATOR_REWARDS_ADDRESS = "NPCREWARDSWALLET000000000000000000000000000"
+
 
 
 async def _get_or_create_staker(session: AsyncSession, address: str) -> Staker:
@@ -121,6 +128,14 @@ async def _apply_single_tx(session: AsyncSession, tx: dict, height: int) -> None
     addr_from = canonicalize(raw_from)
     addr_to = canonicalize(raw_to)
 
+    # Validator rewards pool inflow: L1 paid into NPCREWARDSWALLET on this block.
+    # Distribute the amount proportionally across active validators by stake.
+    # Note: NOT canonicalized for the rewards address — it's a hardcoded string,
+    # and we want the literal compare to the constant defined above.
+    if tx_type == "transfer" and raw_to == VALIDATOR_REWARDS_ADDRESS:
+        await _credit_validator_rewards_pool(session, amount, height)
+        return
+
     is_to_escrow = addr_to == settings.stake_address
     is_from_escrow = addr_from == settings.stake_address
 
@@ -176,3 +191,101 @@ async def get_active_stakers(session: AsyncSession) -> list[Staker]:
     q = select(Staker).where(Staker.staked_amount > 0)
     result = await session.execute(q)
     return list(result.scalars())
+
+
+async def _credit_validator_rewards_pool(
+    session: AsyncSession, amount: int, block_height: int
+) -> None:
+    """Distribute a single L1 pool inflow across active validators by stake weight.
+
+    Idempotent on block_height — the reward_pool_inflows.block_height UNIQUE
+    constraint ensures we credit each block exactly once even if the watcher
+    re-processes a block.
+
+    Distribution math is integer-only (no floats). Any rounding dust stays
+    in the conceptual pool; we record it on the inflow row so a future
+    distribution can sweep it if we want, or it can stay accounted for in
+    the audit trail.
+    """
+    if amount <= 0:
+        return
+
+    # Idempotency check: have we already processed this block's inflow?
+    existing = await session.execute(
+        select(RewardPoolInflow).where(RewardPoolInflow.block_height == block_height)
+    )
+    if existing.scalar_one_or_none() is not None:
+        log.debug(
+            "reward_pool_inflow_already_processed",
+            height=block_height,
+            amount=amount,
+        )
+        return
+
+    active = await get_active_stakers(session)
+    total_stake = sum(s.staked_amount for s in active)
+
+    if total_stake == 0:
+        # No validators → record the inflow with zero distribution. Money sits
+        # at NPCREWARDSWALLET on L1; we'll let it accumulate for the next
+        # distribution that has at least one validator. (Long-term: sweep it
+        # back to foundation, but that's a later patch.)
+        session.add(
+            RewardPoolInflow(
+                block_height=block_height,
+                amount=amount,
+                distributed_to_count=0,
+                dust_remaining=amount,
+            )
+        )
+        log.info(
+            "reward_pool_inflow_no_validators",
+            height=block_height,
+            amount=amount,
+        )
+        return
+
+    distributed = 0
+    paid_count = 0
+    for staker in active:
+        # Integer math: (amount * stake) / total — no floats, no rounding drift.
+        share = (amount * staker.staked_amount) // total_stake
+        if share <= 0:
+            continue
+
+        # Upsert pending_rewards row for this validator.
+        existing_reward = await session.get(ValidatorReward, staker.address)
+        if existing_reward is None:
+            session.add(
+                ValidatorReward(
+                    address=staker.address,
+                    pending_rewards=share,
+                    last_credited_height=block_height,
+                )
+            )
+        else:
+            existing_reward.pending_rewards += share
+            existing_reward.last_credited_height = block_height
+
+        distributed += share
+        paid_count += 1
+
+    dust = amount - distributed
+
+    session.add(
+        RewardPoolInflow(
+            block_height=block_height,
+            amount=amount,
+            distributed_to_count=paid_count,
+            dust_remaining=dust,
+        )
+    )
+
+    log.info(
+        "reward_pool_inflow_distributed",
+        height=block_height,
+        amount=amount,
+        validators=paid_count,
+        dust=dust,
+    )
+

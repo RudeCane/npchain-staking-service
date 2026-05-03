@@ -1,0 +1,28 @@
+[Unit]
+Description=NPChain Staking Service
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=npchain-staking
+Group=npchain-staking
+WorkingDirectory=/opt/npchain-staking
+EnvironmentFile=/opt/npchain-staking/.env
+EnvironmentFile=/etc/npchain-staking/secrets.env
+ExecStart=/opt/npchain-staking/venv/bin/uvicorn src.main:app --host 127.0.0.1 --port 8950 --workers 1 --no-access-log
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/var/log/npchain-staking/service.log
+StandardError=append:/var/log/npchain-staking/service.log
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/log/npchain-staking
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

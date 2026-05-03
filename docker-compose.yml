@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: npchain-staking-pg
+    environment:
+      POSTGRES_USER: npchain
+      POSTGRES_PASSWORD: npchain_dev_pw
+      POSTGRES_DB: npchain_staking
+    ports:
+      - "5432:5432"
+    volumes:
+      - npchain_staking_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U npchain"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  npchain_staking_pg_data:

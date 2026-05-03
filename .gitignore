@@ -1,0 +1,47 @@
+# ── Secrets — NEVER commit ────────────────────────────────────────
+poolwallet.key.enc
+poolwallet.key.enc.*
+poolwallet.key
+*.key
+*.key.enc
+.env
+.env.*
+secrets.env
+*.passphrase
+
+# ── Build artifacts ───────────────────────────────────────────────
+native/build/
+native/libnpc_dilithium3.so
+native/pool_keygen
+native/_verbose_test*
+native/_xtest*
+native/VERSION
+
+# ── Python ────────────────────────────────────────────────────────
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── Logs / runtime ────────────────────────────────────────────────
+logs/
+*.log
+*.pid
+
+# ── Backups ───────────────────────────────────────────────────────
+backups/
+
+# ── Editor crud ───────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# stale editor/sed backups
+*.bak
